@@ -29,12 +29,13 @@ fn map_chunk(cap: usize) -> *mut u8 {
             std::ptr::null_mut(),
             cap + (2 << 20),
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
             0,
         );
         assert!(p != libc::MAP_FAILED, "arena mmap failed");
         let a = ((p as usize) + (2 << 20) - 1) & !((2 << 20) - 1);
+        #[cfg(target_os = "linux")]
         if std::env::var_os("NOHUGE").is_none() {
             libc::madvise(a as *mut libc::c_void, cap, libc::MADV_HUGEPAGE);
         }
@@ -221,15 +222,19 @@ unsafe fn stream_copy(dst: *mut u8, src: *const u8, n: usize) {
 
 /// Global allocator: large allocations (>= 1 MB) get their own huge-page-advised
 /// mapping, so big tables and buffers fault in 2 MB at a time; the rest go to malloc.
+#[cfg(target_os = "linux")]
 pub struct HugeAlloc;
 
+#[cfg(target_os = "linux")]
 const HUGE_MIN: usize = 1 << 20;
 
 #[inline]
+#[cfg(target_os = "linux")]
 fn round_up(n: usize) -> usize {
     (n + 4095) & !4095
 }
 
+#[cfg(target_os = "linux")]
 unsafe fn big_map(size: usize) -> *mut u8 {
     let n = round_up(size);
     let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
@@ -242,6 +247,7 @@ unsafe fn big_map(size: usize) -> *mut u8 {
     p as *mut u8
 }
 
+#[cfg(target_os = "linux")]
 unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         if l.size() >= HUGE_MIN && l.align() <= 4096 {

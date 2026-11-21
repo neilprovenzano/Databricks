@@ -24,6 +24,7 @@ mod scan;
 use mem::{blk_of, Arena, Scat, Store};
 use scan::scan;
 
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: mem::HugeAlloc = mem::HugeAlloc;
 
@@ -70,7 +71,13 @@ impl Files {
     /// (or straight from the mapping if READ_MMAP is set). f gets (bytes, base offset).
     #[inline]
     fn with_chunk<R>(&self, fi: usize, st: usize, en: usize, use_mmap: bool, f: impl FnOnce(&[u8], usize) -> R) -> R {
+        // Opt-in experiment: compare zero-copy mmap reads against pread.
+        // Default remains the previously validated pread behavior.
         let _ = use_mmap;
+        if std::env::var_os("READ_MMAP").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let bytes = &self.maps[fi].as_ref().expect("mapped input")[st..en];
+            return f(bytes, st);
+        }
         BUF.with(|b| {
             let mut b = b.borrow_mut();
             let n = en - st;
@@ -506,6 +513,12 @@ unsafe fn parse_ingest(s: &[u8], mt: &Months) -> Option<i64> {
     Some(((m1 + d - 1) * 86400 + h * 3600 + mi * 60 + se) * 1000)
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+unsafe fn parse_ingest(s: &[u8], mt: &Months) -> Option<i64> {
+    parse_ts_f1(s, mt)
+}
+
 /// As parse_ts_m, but may read up to 16 bytes from s.as_ptr() (the buffer must allow it).
 #[inline(always)]
 unsafe fn parse_ts_m16(s: &[u8], mt: &Months) -> Option<i64> {
@@ -864,8 +877,6 @@ pub struct Links {
     keys: Vec<u64>,
     vals: Vec<u32>,
     person: Vec<(u64, u64)>,
-    // Optional exact negative prefilter. False positives fall through to the table.
-    filters: Vec<[u64; 64]>,
 }
 
 impl Links {
@@ -876,27 +887,9 @@ impl Links {
         prefetch(unsafe { self.keys.as_ptr().add(i) });
         prefetch(unsafe { self.vals.as_ptr().add(i) });
     }
-    #[inline(always)]
-    fn filter_positions(h: u64) -> (usize, usize) {
-        // Use a mixed hash because the upper nine bits already select the bucket.
-        let mut x = h ^ (h >> 33);
-        x = x.wrapping_mul(0xff51afd7ed558ccd);
-        x ^= x >> 33;
-        let a = (x as usize) & 4095;
-        let b = ((x >> 21) as usize) & 4095;
-        (a, b)
-    }
     /// Person (component id, name loc) of a linked ID in user bucket b.
     #[inline(always)]
     fn get(&self, b: usize, h: u64) -> Option<(u64, u64)> {
-        if option_env!("LINK_FILTER").is_some() {
-            let (a, c) = Self::filter_positions(h);
-            let filter = &self.filters[b];
-            if (filter[a >> 6] & (1u64 << (a & 63))) == 0 ||
-               (filter[c >> 6] & (1u64 << (c & 63))) == 0 {
-                return None;
-            }
-        }
         let lb = &self.buckets[b];
         let off = lb.off as usize;
         let mask = lb.mask as usize;
@@ -912,6 +905,54 @@ impl Links {
             }
             i = (i + 1) & mask;
         }
+    }
+}
+
+// V5 experiment: direct-mapped exact memoization of link lookups.
+// A cached miss is as safe as a cached hit: the link table is immutable in P4.
+// This is intentionally separate from the rejected Bloom-filter experiment.
+const LINK_CACHE_BITS: usize = 11;
+const LINK_CACHE_SIZE: usize = 1 << LINK_CACHE_BITS;
+#[derive(Clone, Copy, Default)]
+struct LinkCacheEntry {
+    key: u64,
+    pid: u64,
+    name: u64,
+    generation: u32,
+    found: bool,
+}
+struct LinkCache {
+    entries: Box<[LinkCacheEntry]>,
+    generation: u32,
+}
+impl LinkCache {
+    fn new() -> Self {
+        Self { entries: vec![LinkCacheEntry::default(); LINK_CACHE_SIZE].into_boxed_slice(), generation: 1 }
+    }
+    #[inline(always)]
+    fn next_bucket(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.entries.fill(LinkCacheEntry::default());
+            self.generation = 1;
+        }
+    }
+    #[inline(always)]
+    fn get(&mut self, links: &Links, bucket: usize, hash: u64) -> Option<(u64, u64)> {
+        // Mix low bits because the high bits were already used to select bucket.
+        let mixed = hash ^ (hash >> 29) ^ (hash >> 47);
+        let i = (mixed as usize) & (LINK_CACHE_SIZE - 1);
+        let e = &mut self.entries[i];
+        if e.generation == self.generation && e.key == hash {
+            return if e.found { Some((e.pid, e.name)) } else { None };
+        }
+        let result = links.get(bucket, hash);
+        let (pid, name, found) = match result {
+            Some((pid, name)) => (pid, name, true),
+            None => (0, 0, false),
+        };
+        *e = LinkCacheEntry { key: hash, pid, name, generation: self.generation, found };
+        result
     }
 }
 
@@ -1136,6 +1177,8 @@ fn main() {
     let npb_used = (ncomp >> rb) + 1;
     let sess: Vec<Mutex<Sess>> = (0..nthreads).map(|_| Mutex::new(Sess::new(ncamp, ncats, ndays))).collect();
     let next = AtomicUsize::new(0);
+    // Runtime switch: unlike option_env!, this responds to each benchmark run.
+    let use_link_cache = std::env::var("LINK_CACHE").map(|v| v == "1").unwrap_or(false);
     let pparts: Vec<(Store<PRec>, Store<CRec>)> = par(nthreads, |t| {
         let mut ar = arenas[t].lock().unwrap();
         let [aa, _, _] = &mut *ar;
@@ -1145,6 +1188,7 @@ fn main() {
         let mut pc: Scat<CRec, 8> = Scat::new(npb_used, blk_of::<CRec>());
         let mut ue: Vec<PRec> = Vec::new();
         let mut uc: Vec<CRec> = Vec::new();
+        let mut link_cache = LinkCache::new();
         loop {
             let b = next.fetch_add(1, Ordering::Relaxed);
             if b >= NUB {
@@ -1152,13 +1196,14 @@ fn main() {
             }
             ue.clear();
             uc.clear();
+            link_cache.next_bucket();
             for t in &wparts {
                 t.for_each_slice(b, |sl| {
                     for (j, r) in sl.iter().enumerate() {
                         if let Some(n) = sl.get(j + 8) {
                             lbs.prefetch(b, n.user);
                         }
-                        match lbs.get(b, r.user) {
+                        match if use_link_cache { link_cache.get(&lbs, b, r.user) } else { lbs.get(b, r.user) } {
                             Some((pid, nloc)) => {
                                 pe.push(aa, (pid >> rb) as usize, PRec { pkey: pid, b: (r.b & !LOC_MASK) | nloc, c: r.c });
                             }
@@ -1173,7 +1218,7 @@ fn main() {
                         if let Some(n) = sl.get(j + 8) {
                             lbs.prefetch(b, n.key);
                         }
-                        match lbs.get(b, c.key) {
+                        match if use_link_cache { link_cache.get(&lbs, b, c.key) } else { lbs.get(b, c.key) } {
                             Some((pid, _)) => {
                                 pc.push(aa, (pid >> rb) as usize, CRec { key: pid, ..*c });
                             }
@@ -1447,17 +1492,7 @@ fn build_links(files: &Files, lwork: &[(Kind, usize, usize, usize)]) -> (Links, 
     }
     let _ = &ghash;
     lap("persons");
-    let mut filters = vec![[0u64; 64]; NUB];
-    for b in 0..NUB {
-        let lb = &buckets[b];
-        for &h in &keys[lb.off as usize .. lb.off as usize + lb.mask as usize + 1] {
-            if h == 0 { continue; }
-            let (a, c) = Links::filter_positions(h);
-            filters[b][a >> 6] |= 1u64 << (a & 63);
-            filters[b][c >> 6] |= 1u64 << (c & 63);
-        }
-    }
-    (Links { buckets, keys, vals, person, filters }, ncomp as usize)
+    (Links { buckets, keys, vals, person }, ncomp as usize)
 }
 
 // ---------------------------------------------------------------- events

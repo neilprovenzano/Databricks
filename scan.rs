@@ -1,3 +1,6 @@
+static SWAR_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static AVX2_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 // Structural CSV scanner. For each line of d[st..en] with exactly N fields and
 // valid quoting, calls f(fields) where each field is the (start, end) byte range
 // of its value (quotes stripped). Malformed lines are skipped.
@@ -25,8 +28,35 @@ fn masks_scalar(b: &[u8; 64]) -> (u64, u64, u64) {
     (c, n, q)
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+// Experimental SWAR delimiter detector: eight bytes per 64-bit word.
+// SCAN_SWAR=1 enables it on macOS/ARM and other non-AVX2 targets.
+// This computes exact per-byte equality masks (no cross-byte borrow errors).
 #[inline(always)]
+fn eq8(x: u64, byte: u8) -> u8 {
+    let z = x ^ (0x0101_0101_0101_0101u64 * byte as u64);
+    let low = 0x7f7f_7f7f_7f7f_7f7fu64;
+    let high = !( ((z & low).wrapping_add(low)) | z | low ) & 0x8080_8080_8080_8080u64;
+    (((high >> 7).wrapping_mul(0x0102_0408_1020_4080u64)) >> 56) as u8
+}
+
+#[inline(always)]
+fn masks_swar(d: &[u8], base: usize) -> (u64, u64, u64) {
+    let mut c = 0u64;
+    let mut n = 0u64;
+    let mut q = 0u64;
+    for i in 0..8 {
+        // The caller ensures the 64-byte region is in bounds.
+        let x = u64::from_le(unsafe { (d.as_ptr().add(base + i * 8) as *const u64).read_unaligned() });
+        let shift = i * 8;
+        c |= (eq8(x, b',') as u64) << shift;
+        n |= (eq8(x, b'\n') as u64) << shift;
+        q |= (eq8(x, b'"') as u64) << shift;
+    }
+    (c, n, q)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn masks_simd(p: *const u8) -> (u64, u64, u64) {
     let a = _mm256_loadu_si256(p as *const __m256i);
     let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
@@ -40,12 +70,22 @@ unsafe fn masks_simd(p: *const u8) -> (u64, u64, u64) {
 #[inline(always)]
 fn masks(d: &[u8], base: usize) -> (u64, u64, u64) {
     if base + 64 <= d.len() {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            return unsafe { masks_simd(d.as_ptr().add(base)) };
+            // Runtime dispatch works even when the binary was built for generic x86-64.
+            // SCAN_AVX2=0 allows a controlled comparison against SWAR/scalar.
+            if *AVX2_ENABLED.get_or_init(|| {
+                std::env::var_os("SCAN_AVX2").as_deref() != Some(std::ffi::OsStr::new("0"))
+                    && std::is_x86_feature_detected!("avx2")
+            }) {
+                return unsafe { masks_simd(d.as_ptr().add(base)) };
+            }
         }
         #[allow(unreachable_code)]
         {
+            if *SWAR_ENABLED.get_or_init(|| std::env::var_os("SCAN_SWAR").as_deref() == Some(std::ffi::OsStr::new("1"))) {
+                return masks_swar(d, base);
+            }
             let mut buf = [0u8; 64];
             buf.copy_from_slice(&d[base..base + 64]);
             masks_scalar(&buf)
