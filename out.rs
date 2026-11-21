@@ -310,25 +310,3 @@ pub fn write_camp(path: &Path, agg: &[CampAgg], names: &[(&[u8], &[u8])], ndays:
     }
     write_file(path, &cols, n)
 }
-
-pub fn write_empty(user: &Path, camp: &Path) -> std::io::Result<()> {
-    let u = vec![
-        Col::new("user_id", Kind::Str, 0),
-        Col::new("day", Kind::Date, 0),
-        Col::new("sessions", Kind::I64, 0),
-        Col::new("events", Kind::I64, 0),
-        Col::new("revenue_cents", Kind::I64, 0),
-        Col::new("top_category", Kind::OptStr, 0),
-    ];
-    write_file(user, &u, 0)?;
-    let c = vec![
-        Col::new("campaign_id", Kind::Str, 0),
-        Col::new("channel", Kind::Str, 0),
-        Col::new("day", Kind::Date, 0),
-        Col::new("sessions", Kind::I64, 0),
-        Col::new("purchasing_sessions", Kind::I64, 0),
-        Col::new("revenue_cents", Kind::I64, 0),
-        Col::new("assisted_sessions", Kind::I64, 0),
-    ];
-    write_file(camp, &c, 0)
-}

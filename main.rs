@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
-mod diag;
 mod mem;
 mod out;
 mod scan;
@@ -865,6 +864,8 @@ pub struct Links {
     keys: Vec<u64>,
     vals: Vec<u32>,
     person: Vec<(u64, u64)>,
+    // Optional exact negative prefilter. False positives fall through to the table.
+    filters: Vec<[u64; 64]>,
 }
 
 impl Links {
@@ -875,9 +876,27 @@ impl Links {
         prefetch(unsafe { self.keys.as_ptr().add(i) });
         prefetch(unsafe { self.vals.as_ptr().add(i) });
     }
+    #[inline(always)]
+    fn filter_positions(h: u64) -> (usize, usize) {
+        // Use a mixed hash because the upper nine bits already select the bucket.
+        let mut x = h ^ (h >> 33);
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        let a = (x as usize) & 4095;
+        let b = ((x >> 21) as usize) & 4095;
+        (a, b)
+    }
     /// Person (component id, name loc) of a linked ID in user bucket b.
     #[inline(always)]
     fn get(&self, b: usize, h: u64) -> Option<(u64, u64)> {
+        if option_env!("LINK_FILTER").is_some() {
+            let (a, c) = Self::filter_positions(h);
+            let filter = &self.filters[b];
+            if (filter[a >> 6] & (1u64 << (a & 63))) == 0 ||
+               (filter[c >> 6] & (1u64 << (c & 63))) == 0 {
+                return None;
+            }
+        }
         let lb = &self.buckets[b];
         let off = lb.off as usize;
         let mask = lb.mask as usize;
@@ -933,10 +952,6 @@ fn microbench(path: &str) {
 }
 
 fn main() {
-    if std::env::var_os("DIAG_CHILD").is_none() {
-        diag::run();
-        std::process::exit(0);
-    }
     if let Ok(p) = std::env::var("MICROBENCH") {
         microbench(&p);
         return;
@@ -1432,7 +1447,17 @@ fn build_links(files: &Files, lwork: &[(Kind, usize, usize, usize)]) -> (Links, 
     }
     let _ = &ghash;
     lap("persons");
-    (Links { buckets, keys, vals, person }, ncomp as usize)
+    let mut filters = vec![[0u64; 64]; NUB];
+    for b in 0..NUB {
+        let lb = &buckets[b];
+        for &h in &keys[lb.off as usize .. lb.off as usize + lb.mask as usize + 1] {
+            if h == 0 { continue; }
+            let (a, c) = Links::filter_positions(h);
+            filters[b][a >> 6] |= 1u64 << (a & 63);
+            filters[b][c >> 6] |= 1u64 << (c & 63);
+        }
+    }
+    (Links { buckets, keys, vals, person, filters }, ncomp as usize)
 }
 
 // ---------------------------------------------------------------- events
