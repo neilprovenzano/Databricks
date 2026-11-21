@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
+mod diag;
 mod mem;
 mod out;
 mod scan;
@@ -31,7 +32,7 @@ const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
 fn chunk_size() -> usize {
-    std::env::var("CHUNK_KB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(512) * 1024
+    std::env::var("CHUNK_KB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(256) * 1024
 }
 
 const EB_BITS: u32 = 10; // event_id buckets
@@ -932,6 +933,10 @@ fn microbench(path: &str) {
 }
 
 fn main() {
+    if std::env::var_os("DIAG_CHILD").is_none() {
+        diag::run();
+        std::process::exit(0);
+    }
     if let Ok(p) = std::env::var("MICROBENCH") {
         microbench(&p);
         return;
