@@ -994,12 +994,13 @@ fn main() {
         let [_, abw, _] = &mut *ar;
         let mut wb: Scat<WRec, 8> = Scat::new(NUB, 2048);
         let mut tab: Vec<DEnt> = Vec::new();
+        let mut ins: Vec<u32> = Vec::new();
         loop {
             let b = next.fetch_add(1, Ordering::Relaxed);
             if b >= NEB {
                 break;
             }
-            dedup_bucket(&ev_parts, b, &mut tab, &mut wb, abw);
+            dedup_bucket(&ev_parts, b, &mut tab, &mut ins, &mut wb, abw);
         }
         wb.finish(abw)
     });
@@ -1394,11 +1395,15 @@ impl Default for DEnt {
     }
 }
 
-fn dedup_bucket(parts: &[Store<ERec>], b: usize, tab: &mut Vec<DEnt>, wb: &mut Scat<WRec, 8>, ar: &mut Arena) {
+fn dedup_bucket(parts: &[Store<ERec>], b: usize, tab: &mut Vec<DEnt>, ins: &mut Vec<u32>, wb: &mut Scat<WRec, 8>, ar: &mut Arena) {
     let n: usize = parts.iter().map(|p| p.len(b)).sum();
     let cap = (n * 3 / 2 + 16).next_power_of_two();
-    tab.clear();
-    tab.resize(cap, DEnt::default());
+    // the table is all-empty between calls (used slots are cleared at the end)
+    if tab.len() < cap {
+        tab.clear();
+        tab.resize(cap, DEnt::default());
+    }
+    ins.clear();
     let mask = cap - 1;
     // key = (eid low bits) + 1, never 0 (cat sits in bits 56.. of `a`, above EID_MASK)
     for p in parts {
@@ -1418,6 +1423,7 @@ fn dedup_bucket(parts: &[Store<ERec>], b: usize, tab: &mut Vec<DEnt>, wb: &mut S
                     }
                     if e.key == 0 {
                         *e = DEnt { key, rec: r };
+                        ins.push(i as u32);
                         break;
                     }
                     i = (i + 1) & mask;
@@ -1425,10 +1431,9 @@ fn dedup_bucket(parts: &[Store<ERec>], b: usize, tab: &mut Vec<DEnt>, wb: &mut S
             }
         });
     }
-    for e in tab.iter() {
-        if e.key == 0 {
-            continue;
-        }
+    for &i in ins.iter() {
+        let e = unsafe { tab.get_unchecked_mut(i as usize) };
+        e.key = 0;
         let r = unsafe { &*e.rec };
         let ts = r.c as u32;
         if ts != TS_INVALID {
