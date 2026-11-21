@@ -32,8 +32,10 @@
             {
                 let mut buf = v.clone();
                 buf.extend_from_slice(&[b'7'; 16]);
+                buf.extend_from_slice(&[b'7'; 32]);
                 let got = unsafe { parse_ts_m16(&buf[..v.len()], &mts[0]) };
                 assert_eq!(got, parse_ts_slow(&v), "m16 {:?}", String::from_utf8_lossy(&v));
+
             }
             for mt in &mts {
                 assert_eq!(parse_ts_m(&v, mt), parse_ts_slow(&v), "{:?}", String::from_utf8_lossy(&v));
@@ -72,3 +74,30 @@
             assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&d));
         }
     }
+
+#[test]
+fn ingest_valid_f1() {
+    let mt = Months::new(parse_ts_slow(b"2028-02-21T00:00:00Z").unwrap());
+    let mut x: u64 = 77;
+    let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    for _ in 0..1_000_000 {
+        let ms = 1_700_000_000_000i64 + (rnd() % 200_000_000_000) as i64;
+        let secs = ms / 1000;
+        let days = secs.div_euclid(86400);
+        let rem = secs.rem_euclid(86400);
+        // civil from days
+        let z = days + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+        let s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60);
+        let mut buf = s.as_bytes().to_vec();
+        buf.extend_from_slice(&[b'1'; 32]);
+        assert_eq!(unsafe { parse_ingest(&buf[..20], &mt) }, parse_ts_slow(s.as_bytes()), "{s}");
+    }
+}

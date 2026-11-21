@@ -4,7 +4,16 @@
 
 use std::marker::PhantomData;
 
+/// Size of every record block; blocks can be recycled between stores.
+pub const BLOCK: usize = 64 << 10;
+
+/// Records per block for T (a multiple of 8, the write-combining batch).
+pub const fn blk_of<T>() -> usize {
+    (BLOCK / std::mem::size_of::<T>()) / 8 * 8
+}
+
 pub struct Arena {
+    free: Vec<*mut u8>,
     chunks: Vec<(*mut u8, usize)>,
     cur: usize, // index of the chunk in use
     off: usize,
@@ -35,10 +44,19 @@ fn map_chunk(cap: usize) -> *mut u8 {
 
 impl Arena {
     pub fn new(_hint: usize) -> Arena {
-        Arena { chunks: Vec::new(), cur: 0, off: 0 }
+        Arena { free: Vec::new(), chunks: Vec::new(), cur: 0, off: 0 }
+    }
+    /// Hand a dead BLOCK-sized block to this arena for reuse.
+    pub fn give(&mut self, p: *mut u8) {
+        self.free.push(p);
     }
     #[inline]
     pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
+        if bytes <= BLOCK {
+            if let Some(p) = self.free.pop() {
+                return p;
+            }
+        }
         loop {
             if self.cur < self.chunks.len() {
                 let (base, cap) = self.chunks[self.cur];
@@ -76,7 +94,12 @@ unsafe impl<T: Copy + Send> Send for Store<T> {}
 unsafe impl<T: Copy + Sync> Sync for Store<T> {}
 
 impl<T: Copy> Store<T> {
+    /// The blocks of bucket b (to recycle once the bucket is consumed).
+    pub fn blocks(&self, b: usize) -> &[*mut T] {
+        &self.heads[b].blocks
+    }
     pub fn new(nb: usize, blk: usize) -> Self {
+        assert!(blk * std::mem::size_of::<T>() <= BLOCK);
         Store {
             heads: (0..nb).map(|_| Head { cur: std::ptr::null_mut(), len: blk as u32, blocks: Vec::new() }).collect(),
             blk: blk as u32,
@@ -87,7 +110,7 @@ impl<T: Copy> Store<T> {
     pub fn push(&mut self, arena: &mut Arena, b: usize, v: T) {
         let h = unsafe { self.heads.get_unchecked_mut(b) };
         if h.len == self.blk {
-            let p = arena.alloc(self.blk as usize * std::mem::size_of::<T>()) as *mut T;
+            let p = arena.alloc(BLOCK) as *mut T;
             h.blocks.push(p);
             h.cur = p;
             h.len = 0;
@@ -121,7 +144,7 @@ impl<T: Copy> Store<T> {
     pub fn reserve(&mut self, arena: &mut Arena, b: usize, k: usize) -> *mut T {
         let h = unsafe { self.heads.get_unchecked_mut(b) };
         if h.len == self.blk {
-            let p = arena.alloc(self.blk as usize * std::mem::size_of::<T>()) as *mut T;
+            let p = arena.alloc(BLOCK) as *mut T;
             h.blocks.push(p);
             h.cur = p;
             h.len = 0;
@@ -194,4 +217,75 @@ unsafe fn stream_copy(dst: *mut u8, src: *const u8, n: usize) {
     }
     #[allow(unreachable_code)]
     std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
+/// Global allocator: large allocations (>= 1 MB) get their own huge-page-advised
+/// mapping, so big tables and buffers fault in 2 MB at a time; the rest go to malloc.
+pub struct HugeAlloc;
+
+const HUGE_MIN: usize = 1 << 20;
+
+#[inline]
+fn round_up(n: usize) -> usize {
+    (n + 4095) & !4095
+}
+
+unsafe fn big_map(size: usize) -> *mut u8 {
+    let n = round_up(size);
+    let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+    if p == libc::MAP_FAILED {
+        return std::ptr::null_mut();
+    }
+    if n >= (2 << 20) {
+        libc::madvise(p, n, libc::MADV_HUGEPAGE);
+    }
+    p as *mut u8
+}
+
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= HUGE_MIN && l.align() <= 4096 {
+            big_map(l.size())
+        } else {
+            std::alloc::System.alloc(l)
+        }
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= HUGE_MIN && l.align() <= 4096 {
+            big_map(l.size()) // fresh anonymous memory is zero
+        } else {
+            std::alloc::System.alloc_zeroed(l)
+        }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if l.size() >= HUGE_MIN && l.align() <= 4096 {
+            libc::munmap(p as *mut libc::c_void, round_up(l.size()));
+        } else {
+            std::alloc::System.dealloc(p, l)
+        }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        let old_big = l.size() >= HUGE_MIN && l.align() <= 4096;
+        let new_big = new >= HUGE_MIN && l.align() <= 4096;
+        if !old_big && !new_big {
+            return std::alloc::System.realloc(p, l, new);
+        }
+        if old_big && new_big {
+            let q = libc::mremap(p as *mut libc::c_void, round_up(l.size()), round_up(new), libc::MREMAP_MAYMOVE);
+            if q == libc::MAP_FAILED {
+                return std::ptr::null_mut();
+            }
+            if round_up(new) >= (2 << 20) {
+                libc::madvise(q, round_up(new), libc::MADV_HUGEPAGE);
+            }
+            return q as *mut u8;
+        }
+        let nl = std::alloc::Layout::from_size_align_unchecked(new, l.align());
+        let q = self.alloc(nl);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+            self.dealloc(p, l);
+        }
+        q
+    }
 }

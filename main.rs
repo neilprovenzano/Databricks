@@ -21,8 +21,11 @@ use xxhash_rust::xxh3::xxh3_64;
 mod mem;
 mod out;
 mod scan;
-use mem::{Arena, Scat, Store};
+use mem::{blk_of, Arena, Scat, Store};
 use scan::scan;
+
+#[global_allocator]
+static GLOBAL: mem::HugeAlloc = mem::HugeAlloc;
 
 const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
@@ -463,6 +466,46 @@ fn parse_ts_m(s: &[u8], mt: &Months) -> Option<i64> {
     parse_ts(s)
 }
 
+/// Shuffle tables right-aligning n digits (n = 0..=16) in 16 bytes.
+static SHUF16: [[i8; 16]; 17] = {
+    let mut t = [[-1i8; 16]; 17];
+    let mut n = 0;
+    while n <= 16 {
+        let mut i = 0;
+        while i < n {
+            t[n][16 - n + i] = i as i8;
+            i += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+/// ingest_ts: the rules guarantee valid F1, so decode it without validation.
+/// Reads 16 bytes from s.as_ptr() (buffer slack).
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn parse_ingest(s: &[u8], mt: &Months) -> Option<i64> {
+    use std::arch::x86_64::*;
+    if s.len() != 20 {
+        return parse_ts_f1(s, mt);
+    }
+    let t = _mm_sub_epi8(_mm_loadu_si128(s.as_ptr() as *const __m128i), _mm_set1_epi8(b'0' as i8));
+    let g = _mm_shuffle_epi8(t, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+    let p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+    let y = (_mm_extract_epi16(p, 0) as i64) * 100 + _mm_extract_epi16(p, 1) as i64;
+    let mo = _mm_extract_epi16(p, 2) as i64;
+    let d = _mm_extract_epi16(p, 3) as i64;
+    let h = _mm_extract_epi16(p, 4) as i64;
+    let mi = _mm_extract_epi16(p, 5) as i64;
+    let se = ((*s.get_unchecked(17)).wrapping_sub(b'0') as i64) * 10 + ((*s.get_unchecked(18)).wrapping_sub(b'0') as i64);
+    if !(1..=12).contains(&mo) {
+        return parse_ts_f1(s, mt);
+    }
+    let (m1, _) = mt.get(y, mo);
+    Some(((m1 + d - 1) * 86400 + h * 3600 + mi * 60 + se) * 1000)
+}
+
 /// As parse_ts_m, but may read up to 16 bytes from s.as_ptr() (the buffer must allow it).
 #[inline(always)]
 unsafe fn parse_ts_m16(s: &[u8], mt: &Months) -> Option<i64> {
@@ -561,6 +604,14 @@ fn parse_price(s: &[u8]) -> Option<u32> {
     } else {
         None
     }
+}
+
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
 }
 
 #[inline(always)]
@@ -802,10 +853,46 @@ fn par<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
 
 /// Per user bucket: map user hash -> local id; and per local id the person (name hash, name loc).
 struct LinkBucket {
-    map: U64Map<u32>,
-    hashes: Vec<u64>,
-    locs: Vec<u64>,
+    off: u32,  // table slice of this bucket in Links.keys / Links.vals
+    mask: u32, // slice length - 1 (a power of two)
+}
+
+/// Linked IDs, all buckets in shared arrays: open-addressing tables
+/// (user hash -> global id) and per global id its person (component id, name loc).
+pub struct Links {
+    buckets: Vec<LinkBucket>,
+    keys: Vec<u64>,
+    vals: Vec<u32>,
     person: Vec<(u64, u64)>,
+}
+
+impl Links {
+    #[inline(always)]
+    fn prefetch(&self, b: usize, h: u64) {
+        let lb = &self.buckets[b];
+        let i = lb.off as usize + ((h as usize) & lb.mask as usize);
+        prefetch(unsafe { self.keys.as_ptr().add(i) });
+        prefetch(unsafe { self.vals.as_ptr().add(i) });
+    }
+    /// Person (component id, name loc) of a linked ID in user bucket b.
+    #[inline(always)]
+    fn get(&self, b: usize, h: u64) -> Option<(u64, u64)> {
+        let lb = &self.buckets[b];
+        let off = lb.off as usize;
+        let mask = lb.mask as usize;
+        let mut i = (h as usize) & mask;
+        loop {
+            let k = unsafe { *self.keys.get_unchecked(off + i) };
+            if k == h {
+                let g = unsafe { *self.vals.get_unchecked(off + i) };
+                return Some(unsafe { *self.person.get_unchecked(g as usize) });
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
 }
 
 fn microbench(path: &str) {
@@ -830,7 +917,7 @@ fn microbench(path: &str) {
             scan::<7>(&d, 0, len, |f| {
                 acc = acc.wrapping_add(f[6].1 as u64);
                 if mode >= 1 { acc = acc.wrapping_add(h64(&d[f[0].0..f[0].1])); }
-                if mode >= 2 { acc = acc.wrapping_add(parse_ts_f1(&d[f[3].0..f[3].1], &mt).unwrap_or(0) as u64); }
+                if mode >= 2 { acc = acc.wrapping_add(unsafe { parse_ingest(&d[f[3].0..f[3].1], &mt) }.unwrap_or(0) as u64); }
                 if mode >= 3 { acc = acc.wrapping_add(unsafe { parse_ts_m16(&d[f[2].0..f[2].1], &mt) }.unwrap_or(0) as u64); }
                 if mode >= 4 { acc = acc.wrapping_add(h64(&d[f[1].0..f[1].1])); }
                 if mode >= 5 {
@@ -963,8 +1050,8 @@ fn main() {
                 s.spawn(move || {
                     let mut ar = arenas[t].lock().unwrap();
                     let [aa, _, ac] = &mut *ar;
-                    let mut ebk: Scat<ERec, 8> = Scat::new(NEB, 2048);
-                    let mut cbk: Scat<CRec, 8> = Scat::new(NUB, 1024);
+                    let mut ebk: Scat<ERec, 8> = Scat::new(NEB, blk_of::<ERec>());
+                    let mut cbk: Scat<CRec, 8> = Scat::new(NUB, blk_of::<CRec>());
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= work.len() {
@@ -992,7 +1079,7 @@ fn main() {
     let wparts: Vec<Store<WRec>> = par(nthreads, |t| {
         let mut ar = arenas[t].lock().unwrap();
         let [_, abw, _] = &mut *ar;
-        let mut wb: Scat<WRec, 8> = Scat::new(NUB, 2048);
+        let mut wb: Scat<WRec, 8> = Scat::new(NUB, blk_of::<WRec>());
         let mut tab: Vec<DEnt> = Vec::new();
         let mut ins: Vec<u32> = Vec::new();
         loop {
@@ -1001,6 +1088,12 @@ fn main() {
                 break;
             }
             dedup_bucket(&ev_parts, b, &mut tab, &mut ins, &mut wb, abw);
+            // bucket b is consumed: recycle its blocks for the survivors
+            for p in &ev_parts {
+                for &blk in p.blocks(b) {
+                    abw.give(blk as *mut u8);
+                }
+            }
         }
         wb.finish(abw)
     });
@@ -1026,11 +1119,10 @@ fn main() {
     let pparts: Vec<(Store<PRec>, Store<CRec>)> = par(nthreads, |t| {
         let mut ar = arenas[t].lock().unwrap();
         let [aa, _, _] = &mut *ar;
-        aa.reset();
         let mut ss = sess[t].lock().unwrap();
         let ss = &mut *ss;
-        let mut pe: Scat<PRec, 8> = Scat::new(npb_used, 2048);
-        let mut pc: Scat<CRec, 8> = Scat::new(npb_used, 1024);
+        let mut pe: Scat<PRec, 8> = Scat::new(npb_used, blk_of::<PRec>());
+        let mut pc: Scat<CRec, 8> = Scat::new(npb_used, blk_of::<CRec>());
         let mut ue: Vec<PRec> = Vec::new();
         let mut uc: Vec<CRec> = Vec::new();
         loop {
@@ -1038,15 +1130,16 @@ fn main() {
             if b >= NUB {
                 break;
             }
-            let lb = &lbs[b];
             ue.clear();
             uc.clear();
             for t in &wparts {
                 t.for_each_slice(b, |sl| {
-                    for r in sl {
-                        match lb.map.get(r.user) {
-                            Some(&i) => {
-                                let (pid, nloc) = lb.person[i as usize];
+                    for (j, r) in sl.iter().enumerate() {
+                        if let Some(n) = sl.get(j + 8) {
+                            lbs.prefetch(b, n.user);
+                        }
+                        match lbs.get(b, r.user) {
+                            Some((pid, nloc)) => {
                                 pe.push(aa, (pid >> rb) as usize, PRec { pkey: pid, b: (r.b & !LOC_MASK) | nloc, c: r.c });
                             }
                             None => ue.push(PRec { pkey: r.user, b: r.b, c: r.c }),
@@ -1056,10 +1149,12 @@ fn main() {
             }
             for t in &ck_parts {
                 t.for_each_slice(b, |sl| {
-                    for c in sl {
-                        match lb.map.get(c.key) {
-                            Some(&i) => {
-                                let pid = lb.person[i as usize].0;
+                    for (j, c) in sl.iter().enumerate() {
+                        if let Some(n) = sl.get(j + 8) {
+                            lbs.prefetch(b, n.key);
+                        }
+                        match lbs.get(b, c.key) {
+                            Some((pid, _)) => {
                                 pc.push(aa, (pid >> rb) as usize, CRec { key: pid, ..*c });
                             }
                             None => uc.push(*c),
@@ -1069,6 +1164,17 @@ fn main() {
             }
             ss.g.group_hashed(&ue, &uc);
             ss.run(&files, ws, day0, ndays, ncamp);
+            // user bucket b is consumed: recycle its blocks
+            for p in &wparts {
+                for &blk in p.blocks(b) {
+                    aa.give(blk as *mut u8);
+                }
+            }
+            for p in &ck_parts {
+                for &blk in p.blocks(b) {
+                    aa.give(blk as *mut u8);
+                }
+            }
         }
         (pe.finish(aa), pc.finish(aa))
     });
@@ -1176,12 +1282,12 @@ struct SlotGid {
 
 /// Parse links, assign dense IDs per user bucket, union-find, name each person by
 /// its byte-wise smallest ID. Single-threaded; runs concurrently with event work.
-fn build_links(files: &Files, lwork: &[(Kind, usize, usize, usize)]) -> (Vec<LinkBucket>, usize) {
+fn build_links(files: &Files, lwork: &[(Kind, usize, usize, usize)]) -> (Links, usize) {
     let t0 = std::time::Instant::now();
     let vb = std::env::var_os("VERBOSE").is_some();
     let lap = |w: &str| if vb { eprintln!("     links {w}: {:.3}s", t0.elapsed().as_secs_f64()) };
     let mut ar = Arena::new(0);
-    let mut sc: Scat<Side, 8> = Scat::new(NUB, 512);
+    let mut sc: Scat<Side, 8> = Scat::new(NUB, blk_of::<Side>());
     let mut nend = 0u64; // edge endpoints
     for &(_, fi, st, en) in lwork {
         files.with_chunk(fi, st, en, false, |d, base| {
@@ -1208,31 +1314,47 @@ fn build_links(files: &Files, lwork: &[(Kind, usize, usize, usize)]) -> (Vec<Lin
         sh += 1;
     }
     let nparts = ((nend >> sh) + 1) as usize;
-    let mut sg: Scat<SlotGid, 8> = Scat::new(nparts, 1024);
+    let mut sg: Scat<SlotGid, 8> = Scat::new(nparts, blk_of::<SlotGid>());
     let mut gpre: Vec<u64> = Vec::new();
-    let mut lbs: Vec<LinkBucket> = Vec::with_capacity(NUB);
+    // one table slice per bucket, capacity > number of sides >= number of distinct ids
+    let mut buckets: Vec<LinkBucket> = Vec::with_capacity(NUB);
+    let mut tot = 0usize;
+    for b in 0..NUB {
+        let cap = (store.len(b) + 16).next_power_of_two();
+        buckets.push(LinkBucket { off: tot as u32, mask: (cap - 1) as u32 });
+        tot += cap;
+    }
+    let mut keys = vec![0u64; tot];
+    let mut vals = vec![0u32; tot];
+    let mut ghash: Vec<u64> = Vec::with_capacity(nend as usize / 2 + 16);
+    let mut gloc: Vec<u64> = Vec::with_capacity(nend as usize / 2 + 16);
     let mut gid = 0u32;
     for b in 0..NUB {
-        let n = store.len(b);
-        let mut map = U64Map::<u32>::with_capacity(n / 2 + 8);
-        let mut hashes = Vec::with_capacity(n / 2 + 8);
-        let mut locs = Vec::with_capacity(n / 2 + 8);
-        let base = gid;
+        let off = buckets[b].off as usize;
+        let mask = buckets[b].mask as usize;
         store.for_each_slice(b, |sl| {
             for s in sl {
-                let (i, ex) = map.entry(s.h);
-                if !ex {
-                    *map.val_mut(i) = hashes.len() as u32;
-                    hashes.push(s.h);
-                    locs.push(s.x & LOC_MASK);
-                    gpre.push(s.pre);
-                }
+                let mut i = (s.h as usize) & mask;
+                let g = loop {
+                    let k = keys[off + i];
+                    if k == s.h {
+                        break vals[off + i];
+                    }
+                    if k == 0 {
+                        keys[off + i] = s.h;
+                        vals[off + i] = gid;
+                        ghash.push(s.h);
+                        gloc.push(s.x & LOC_MASK);
+                        gpre.push(s.pre);
+                        gid += 1;
+                        break gid - 1;
+                    }
+                    i = (i + 1) & mask;
+                };
                 let slot = (s.x >> 40) as u32;
-                sg.push(&mut ar, (slot >> sh) as usize, SlotGid { slot, gid: base + map.vals[i] });
+                sg.push(&mut ar, (slot >> sh) as usize, SlotGid { slot, gid: g });
             }
         });
-        gid += hashes.len() as u32;
-        lbs.push(LinkBucket { map, hashes, locs, person: Vec::new() });
     }
     let nids = gid as usize;
     lap("ids-maps");
@@ -1274,12 +1396,6 @@ fn build_links(files: &Files, lwork: &[(Kind, usize, usize, usize)]) -> (Vec<Lin
     drop(edges);
     lap("uf");
     // name: byte-wise smallest ID per root, compared by an 8-byte big-endian prefix first
-    let mut gloc: Vec<u64> = Vec::with_capacity(nids);
-    let mut ghash: Vec<u64> = Vec::with_capacity(nids);
-    for lb in &lbs {
-        gloc.extend_from_slice(&lb.locs);
-        ghash.extend_from_slice(&lb.hashes);
-    }
     let mut best: Vec<u32> = (0..nids as u32).collect();
     for x in 0..nids as u32 {
         let r = find(&mut parent, x);
@@ -1297,27 +1413,21 @@ fn build_links(files: &Files, lwork: &[(Kind, usize, usize, usize)]) -> (Vec<Lin
         }
     }
     lap("names");
-    // dense component ids
+    // dense component ids; person per global id
     let mut comp: Vec<u32> = vec![u32::MAX; nids];
     let mut ncomp = 0u32;
-    let mut x = 0u32;
-    for lb in lbs.iter_mut() {
-        let n = lb.hashes.len();
-        lb.person = Vec::with_capacity(n);
-        for _ in 0..n {
-            let r = find(&mut parent, x) as usize;
-            if comp[r] == u32::MAX {
-                comp[r] = ncomp;
-                ncomp += 1;
-            }
-            let b = best[r] as usize;
-            lb.person.push((comp[r] as u64, gloc[b]));
-            x += 1;
+    let mut person: Vec<(u64, u64)> = Vec::with_capacity(nids);
+    for x in 0..nids as u32 {
+        let r = find(&mut parent, x) as usize;
+        if comp[r] == u32::MAX {
+            comp[r] = ncomp;
+            ncomp += 1;
         }
+        person.push((comp[r] as u64, gloc[best[r] as usize]));
     }
     let _ = &ghash;
     lap("persons");
-    (lbs, ncomp as usize)
+    (Links { buckets, keys, vals, person }, ncomp as usize)
 }
 
 // ---------------------------------------------------------------- events
@@ -1340,7 +1450,7 @@ fn parse_events_in(d: &[u8], base: usize, fi: usize, st: usize, en: usize, ctx: 
         if eid.is_empty() {
             return;
         }
-        let ingest_ms = parse_ts_f1(&d[f[3].0..f[3].1], &ctx.months).unwrap_or(i64::MAX / 4);
+        let ingest_ms = unsafe { parse_ingest(&d[f[3].0..f[3].1], &ctx.months) }.unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000) - ws_s).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
         let h = h64(eid);
         let mut user_h = 0u64;
@@ -1408,7 +1518,10 @@ fn dedup_bucket(parts: &[Store<ERec>], b: usize, tab: &mut Vec<DEnt>, ins: &mut 
     // key = (eid low bits) + 1, never 0 (cat sits in bits 56.. of `a`, above EID_MASK)
     for p in parts {
         p.for_each_slice(b, |sl| {
-            for r in sl {
+            for (j, r) in sl.iter().enumerate() {
+                if let Some(n) = sl.get(j + 8) {
+                    prefetch(unsafe { tab.as_ptr().add((((n.a & EID_MASK) + 1) as usize) & mask) });
+                }
                 let key = (r.a & EID_MASK) + 1;
                 let mut i = (key as usize) & mask;
                 loop {
