@@ -1,0 +1,1 @@
+V11 submission defaults: SCAT_DIRECT=1, DEDUP_PREFETCH=0, READ_MMAP=1, LINK_CACHE=1, SCAN_SWAR=1, DEDUP_SORT=0, DEDUP_CAP=2. NCPU defaults to available parallelism. DEDUP_TABLE is not a recognized setting; earlier comparisons using it all used DEDUP_CAP=2. Build and validate before submitting.

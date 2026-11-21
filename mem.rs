@@ -174,6 +174,13 @@ impl<T: Copy, const K: usize> Scat<T, K> {
     }
     #[inline(always)]
     pub fn push(&mut self, arena: &mut Arena, b: usize, v: T) {
+        // V11: compare direct append against software write combining. This
+        // changes the entire intermediate-record memory path, not the result.
+        static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DIRECT.get_or_init(|| std::env::var_os("SCAT_DIRECT").as_deref() != Some(std::ffi::OsStr::new("0"))) {
+            self.store.push(arena, b, v);
+            return;
+        }
         unsafe {
             let f = *self.fill.get_unchecked(b) as usize;
             *self.buf.get_unchecked_mut(b * K + f) = v;

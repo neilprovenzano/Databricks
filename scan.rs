@@ -83,7 +83,7 @@ fn masks(d: &[u8], base: usize) -> (u64, u64, u64) {
         }
         #[allow(unreachable_code)]
         {
-            if *SWAR_ENABLED.get_or_init(|| std::env::var_os("SCAN_SWAR").as_deref() == Some(std::ffi::OsStr::new("1"))) {
+            if *SWAR_ENABLED.get_or_init(|| std::env::var_os("SCAN_SWAR").as_deref() != Some(std::ffi::OsStr::new("0"))) {
                 return masks_swar(d, base);
             }
             let mut buf = [0u8; 64];

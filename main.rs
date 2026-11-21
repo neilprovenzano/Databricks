@@ -62,6 +62,8 @@ pub struct Files {
     handles: Vec<Option<File>>,
 }
 
+static MMAP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 thread_local! {
     static BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
 }
@@ -74,7 +76,7 @@ impl Files {
         // Opt-in experiment: compare zero-copy mmap reads against pread.
         // Default remains the previously validated pread behavior.
         let _ = use_mmap;
-        if std::env::var_os("READ_MMAP").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        if *MMAP_ENABLED.get_or_init(|| std::env::var_os("READ_MMAP").as_deref() != Some(std::ffi::OsStr::new("0"))) {
             let bytes = &self.maps[fi].as_ref().expect("mapped input")[st..en];
             return f(bytes, st);
         }
@@ -1148,7 +1150,11 @@ fn main() {
             if b >= NEB {
                 break;
             }
-            dedup_bucket(&ev_parts, b, &mut tab, &mut ins, &mut wb, abw);
+            if std::env::var_os("DEDUP_SORT").as_deref() == Some(std::ffi::OsStr::new("1")) {
+                dedup_sort_bucket(&ev_parts, b, &mut wb, abw);
+            } else {
+                dedup_bucket(&ev_parts, b, &mut tab, &mut ins, &mut wb, abw);
+            }
             // bucket b is consumed: recycle its blocks for the survivors
             for p in &ev_parts {
                 for &blk in p.blocks(b) {
@@ -1178,7 +1184,7 @@ fn main() {
     let sess: Vec<Mutex<Sess>> = (0..nthreads).map(|_| Mutex::new(Sess::new(ncamp, ncats, ndays))).collect();
     let next = AtomicUsize::new(0);
     // Runtime switch: unlike option_env!, this responds to each benchmark run.
-    let use_link_cache = std::env::var("LINK_CACHE").map(|v| v == "1").unwrap_or(false);
+    let use_link_cache = std::env::var("LINK_CACHE").map(|v| v != "0").unwrap_or(true);
     let pparts: Vec<(Store<PRec>, Store<CRec>)> = par(nthreads, |t| {
         let mut ar = arenas[t].lock().unwrap();
         let [aa, _, _] = &mut *ar;
@@ -1570,9 +1576,62 @@ impl Default for DEnt {
     }
 }
 
+// V10 experiment: deduplicate by sorting record pointers rather than building a
+// random-access open-addressed hash table. This is an architectural alternative,
+// not a guaranteed speedup. Toggle with DEDUP_SORT=1 to benchmark independently.
+// Sorting uses original encounter index as a tie-breaker, preserving the original
+// hash-table behavior when two copies have identical ingest timestamps.
+fn dedup_sort_bucket(parts: &[Store<ERec>], b: usize, wb: &mut Scat<WRec, 8>, ar: &mut Arena) {
+    let n: usize = parts.iter().map(|p| p.len(b)).sum();
+    let mut records: Vec<(u64, usize, *const ERec)> = Vec::with_capacity(n);
+    for part in parts {
+        part.for_each_slice(b, |sl| {
+            for r in sl {
+                records.push((r.a & EID_MASK, records.len(), r as *const ERec));
+            }
+        });
+    }
+    records.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut i = 0;
+    while i < records.len() {
+        let key = records[i].0;
+        let mut best = records[i].2;
+        let mut best_ingest = unsafe { ((*best).c >> 32) as i32 };
+        i += 1;
+        while i < records.len() && records[i].0 == key {
+            let candidate = records[i].2;
+            let ingest = unsafe { ((*candidate).c >> 32) as i32 };
+            if ingest < best_ingest {
+                best = candidate;
+                best_ingest = ingest;
+            }
+            i += 1;
+        }
+        let r = unsafe { &*best };
+        let ts = r.c as u32;
+        if ts != TS_INVALID {
+            wb.push(ar, ub(r.user), WRec {
+                user: r.user,
+                b: r.b,
+                c: ts as u64 | ((r.a >> 56) << 32),
+            });
+        }
+    }
+}
+
 fn dedup_bucket(parts: &[Store<ERec>], b: usize, tab: &mut Vec<DEnt>, ins: &mut Vec<u32>, wb: &mut Scat<WRec, 8>, ar: &mut Arena) {
     let n: usize = parts.iter().map(|p| p.len(b)).sum();
-    let cap = (n * 3 / 2 + 16).next_power_of_two();
+    // V11: configurable dedup table occupancy; compare memory footprint vs
+    // probe length. DEDUP_CAP=1 uses ~1.25n, =2 uses ~1.5n (baseline),
+    // =3 uses ~2n. Always rounded to a power of two.
+    static CAP_MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let cap_mode = *CAP_MODE.get_or_init(|| std::env::var("DEDUP_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2));
+    let target = match cap_mode {
+        1 => n.saturating_mul(5) / 4 + 16,
+        3 => n.saturating_mul(2) + 16,
+        _ => n.saturating_mul(3) / 2 + 16,
+    };
+    let cap = target.next_power_of_two();
     // the table is all-empty between calls (used slots are cleared at the end)
     if tab.len() < cap {
         tab.clear();
@@ -1580,12 +1639,16 @@ fn dedup_bucket(parts: &[Store<ERec>], b: usize, tab: &mut Vec<DEnt>, ins: &mut 
     }
     ins.clear();
     let mask = cap - 1;
+    static PREFETCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let do_prefetch = *PREFETCH.get_or_init(|| std::env::var_os("DEDUP_PREFETCH").as_deref() == Some(std::ffi::OsStr::new("1")));
     // key = (eid low bits) + 1, never 0 (cat sits in bits 56.. of `a`, above EID_MASK)
     for p in parts {
         p.for_each_slice(b, |sl| {
             for (j, r) in sl.iter().enumerate() {
-                if let Some(n) = sl.get(j + 8) {
-                    prefetch(unsafe { tab.as_ptr().add((((n.a & EID_MASK) + 1) as usize) & mask) });
+                if do_prefetch {
+                    if let Some(n) = sl.get(j + 8) {
+                        prefetch(unsafe { tab.as_ptr().add((((n.a & EID_MASK) + 1) as usize) & mask) });
+                    }
                 }
                 let key = (r.a & EID_MASK) + 1;
                 let mut i = (key as usize) & mask;
